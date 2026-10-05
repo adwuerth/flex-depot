@@ -120,6 +120,22 @@ def _fcr_breakeven_metrics(
     }
 
 
+def _fcr_bid_decision(
+    breakeven_eur_per_mw: float, markup_eur_per_mw: float, clearing_price_eur_per_mw: float
+) -> tuple[float, bool]:
+    """
+    Bid price and acceptance of one FCR slot under pay-as-cleared: the slot is
+    offered at its breakeven plus markup and accepted if the clearing price is
+    at least that high.
+
+    ponytail: a missing breakeven (counterfactual solve failed) or a negative
+    one is treated as 0, i.e. the slot is offered as a price-taker.
+    """
+    breakeven = 0.0 if pd.isna(breakeven_eur_per_mw) else max(float(breakeven_eur_per_mw), 0.0)
+    bid_price = breakeven + float(markup_eur_per_mw)
+    return bid_price, bool(clearing_price_eur_per_mw >= bid_price)
+
+
 class _TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -194,6 +210,8 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
     fcr_bid_block_kw = float(opt_cfg.trading.fcr.bid_block_mw) * 1000.0
     fcr_breakeven_enabled = bool(opt_cfg.trading.fcr.breakeven_analysis)
     fcr_breakeven_include_zero_bid = bool(opt_cfg.trading.fcr.breakeven_include_zero_bid)
+    fcr_bid_acceptance = bool(opt_cfg.trading.fcr.bid_acceptance)
+    fcr_bid_markup = float(opt_cfg.trading.fcr.bid_markup_eur_per_mw)
 
     fcr_energy_reserve_kwh_per_kw = float(opt_cfg.trading.fcr.energy_reserve_minutes) / 60.0
     fcr_reserve_penalty = float(opt_cfg.trading.fcr.reserve_penalty_eur_per_kwh)
@@ -339,6 +357,19 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
 
     all_fcr_slot_starts = list(fcr_prices_full.index)
 
+    # Optional capacity-price forecast error: the solver plans its bids on the
+    # perturbed DECISION prices; fcr_prices_full stays the settlement series
+    # (revenue, acceptance, margins). Disabled -> both are the same object.
+    fcr_decision_prices_full = fcr_prices_full
+    fcr_fe_cfg = opt_cfg.trading.fcr.forecast_error
+    if fcr_enabled and fcr_fe_cfg.enabled and not fcr_prices_full.empty:
+        z_fcr_fe = draw_ar1_shape(fcr_prices_full.index, rho=fcr_fe_cfg.rho, seed=fcr_fe_cfg.seed)
+        fcr_decision_prices_full = (fcr_prices_full + fcr_fe_cfg.sigma_eur_per_mw * z_fcr_fe).clip(lower=0.0)
+        logger.info(
+            f"FCR forecast error active: sigma={fcr_fe_cfg.sigma_eur_per_mw} EUR/MW, "
+            f"rho={fcr_fe_cfg.rho}, seed={fcr_fe_cfg.seed}"
+        )
+
     # Slot-local cap_max and slot_hours, computed against the *full* simulation
     # horizon (not the rolling window) so:
     #   - cap_max[j] reflects headroom over the whole 4 h slot (avoids
@@ -470,6 +501,8 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                 & (fcr_prices_full.index < window_end_ts)
             ]
 
+            window_fcr_decision_prices = fcr_decision_prices_full.loc[window_fcr_prices.index]
+
             # gate-open mask for slots in this window
             # a slot is biddable if (a) its D-1 08:00 gate closure is still in
             # the future and (b) it starts within the FCR price foresight
@@ -539,7 +572,7 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                     imbalance_prices_pos=window_imb_pos,
                     imbalance_prices_neg=window_imb_neg,
                     imbalance_volume_penalty_eur_per_kwh=imb_penalty,
-                    fcr_prices=window_fcr_prices if not window_fcr_prices.empty else None,
+                    fcr_prices=window_fcr_decision_prices if not window_fcr_prices.empty else None,
                     fcr_frequency_data=window_freq_data,
                     fcr_product_hours=fcr_product_hours,
                     fcr_bid_block_kw=fcr_bid_block_kw,
@@ -744,7 +777,7 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                 #   - declined slot (zero bid, only with breakeven_include_zero_bid): force one block ON -> the "entry price" it would need; margin <= 0.
                 breakeven_by_slot: dict[pd.Timestamp, dict] = {}
                 do_breakeven = (
-                    fcr_breakeven_enabled
+                    (fcr_breakeven_enabled or fcr_bid_acceptance)
                     and closing_slots
                     and (any(b[3] > 0 for b in closing_slots) or fcr_breakeven_include_zero_bid)
                 )
@@ -831,8 +864,6 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                         model.z_fcr[k].unfix()
 
                 for j, slot, gate_ts, bid_val, rev_eur in closing_slots:
-                    committed_val = bid_val
-                    committed_fcr_slots[slot] = committed_val
                     fcr_price_val = float(window_fcr_prices.loc[slot])
                     # Hours of this 4 h slot covered by the sim horizon; revenue is prorated to match the optimizer's fcr_revenue term (price is for the full 4 h product).
                     slot_hours = float(fcr_slot_hours_by_slot.get(slot, 4.0))
@@ -844,6 +875,25 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                             **_FCR_BREAKEVEN_NAN,
                         },
                     )
+
+                    # Price-based acceptance: a planned bid is offered at breakeven + markup
+                    # and only committed if the realized clearing price reaches it.
+                    acceptance_cols = {}
+                    committed_val = bid_val
+                    if fcr_bid_acceptance:
+                        bid_price, accepted = float("nan"), False
+                        if bid_val > 0:
+                            bid_price, accepted = _fcr_bid_decision(
+                                breakeven_cols["breakeven_eur_per_mw"], fcr_bid_markup, fcr_price_val
+                            )
+                            if not accepted:
+                                committed_val = 0.0
+                                logger.info(
+                                    f"[{current_time}] FCR bid rejected: {slot} - bid {bid_price:.2f} "
+                                    f"> clearing {fcr_price_val:.2f} €/MW"
+                                )
+                        acceptance_cols = {"bid_price_eur_per_mw": bid_price, "accepted": accepted}
+                    committed_fcr_slots[slot] = committed_val
 
                     if slot >= report_start:  # skip warm-up slots in recorded results
                         fcr_commit_rows.append(
@@ -860,10 +910,11 @@ def run_mpc(settings: Settings, run_dir: Path | None = None) -> Path:
                                 * fcr_price_val
                                 * (slot_hours / fcr_product_hours),
                                 **breakeven_cols,
+                                **acceptance_cols,
                             }
                         )
 
-                    if bid_val > 0:
+                    if committed_val > 0:
                         logger.info(
                             f"[{current_time}] FCR slot committed: {slot} - {committed_val:.1f} kW "
                             f"@ {fcr_price_val:.2f} €/MW"

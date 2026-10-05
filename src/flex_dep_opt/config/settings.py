@@ -65,12 +65,30 @@ class TradingIntraday(BaseModel):
     offset_minutes_before_delivery: int = 30
 
 
+class FCRForecastErrorSettings(BaseModel):
+    # Decision- vs. settlement-price split for the FCR capacity price, like
+    # ForecastErrorSettings for DA/ID: bids are planned on clearing price +
+    # sigma * z (z ~ AR(1), unit variance, floored at 0); revenue is always
+    # settled at the realized clearing price.
+    enabled: bool = False
+    sigma_eur_per_mw: Annotated[float, Field(ge=0.0)] = 0.0
+    rho: Annotated[float, Field(ge=0.0, lt=1.0)] = 0.8  # lag-1 autocorr per FCR slot
+    seed: int = 3
+
+
 class FCRSettings(BaseModel):
     enabled: bool = False
     prices_source: str
     frequency_source: str | None = None
     breakeven_analysis: bool = True
     breakeven_include_zero_bid: bool = False
+    # Price-based acceptance at gate closure: every planned bid is submitted at
+    # its breakeven price (+ markup) and is committed only if the realized
+    # clearing price reaches that bid price (pay-as-cleared). A rejected slot is
+    # committed at zero and the following MPC steps re-plan without it.
+    bid_acceptance: bool = False
+    bid_markup_eur_per_mw: Annotated[float, Field(ge=0.0)] = 0.0
+    forecast_error: FCRForecastErrorSettings = Field(default_factory=FCRForecastErrorSettings)
     gate_closure_hour: str = "08:00"
     gate_closure_closes_previous_day: bool = True
     gate_closure_timezone: str = "Europe/Berlin"
